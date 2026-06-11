@@ -216,13 +216,24 @@ func (idx *Indexer) processOne(ctx context.Context, path string) {
 		chunks = ChunkSession(ps) // returns single chunk for short sessions
 	}
 
-	for _, c := range chunks {
+	for chunkIdx, c := range chunks {
 		chunkPS := c.AsParsedSession()
 		chunkPrompts := chunkPS.UserPrompts()
 		if len(chunkPrompts) == 0 {
 			continue
 		}
-		exCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		// Brief pause between consecutive LLM calls so Ollama can free KV
+		// cache state — a workaround for an Ollama bug where back-to-back
+		// large-prompt calls eventually wedge the daemon. 1.5s between
+		// chunks is barely perceptible (10 chunks = +15s total) and makes
+		// the wedge a lot less likely.
+		if chunkIdx > 0 {
+			time.Sleep(1500 * time.Millisecond)
+		}
+		// Per-extract timeout raised from 2min to 5min — gives Tier C
+		// (CPU-only) hardware breathing room without changing default
+		// behavior on Tier A/B.
+		exCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		meta, err := idx.ext.Extract(exCtx, chunkPS)
 		cancel()
 		if err != nil {

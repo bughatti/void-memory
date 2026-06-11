@@ -36,12 +36,13 @@ func (e *Extractor) Extract(ctx context.Context, ps *ParsedSession) (types.Sessi
 			Summary:  "(empty session, no user prompts)",
 		}, nil
 	}
-	// Stratified sample across the session timeline so we capture topic
-	// SHIFTS, not just the opening theme. For a 10-week session, the user's
-	// focus changes — gear in week 1, addon work in week 3, backend in week
-	// 8. Sampling only the front buckets the whole session by its earliest
-	// topic. We pick samples evenly spaced across the full prompt list.
-	const sampleSize = 120
+	// Stratified sample across the session/chunk timeline. Sample size and
+	// per-prompt cap kept lean — keeps total extraction prompt < ~12K tokens
+	// so Ollama doesn't blow the 16K context window, doesn't pile up KV
+	// cache pressure across back-to-back calls, and stays well under any
+	// reasonable timeout even on Tier C hardware.
+	const sampleSize = 60
+	const promptCharCap = 150
 	excerpts := make([]string, 0, sampleSize)
 	step := 1
 	if len(prompts) > sampleSize {
@@ -53,8 +54,8 @@ func (e *Extractor) Extract(ctx context.Context, ps *ParsedSession) (types.Sessi
 	for i := 0; i < len(prompts); i += step {
 		m := prompts[i]
 		s := strings.ReplaceAll(m.Content, "\n", " ")
-		if len(s) > 200 {
-			s = s[:200] + "..."
+		if len(s) > promptCharCap {
+			s = s[:promptCharCap] + "..."
 		}
 		ts := m.Timestamp.Format("2006-01-02")
 		excerpts = append(excerpts, fmt.Sprintf("- [%s] %s", ts, s))

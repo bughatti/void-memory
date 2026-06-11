@@ -106,6 +106,46 @@ Run a single Claude Code session for 10 weeks? The indexer auto-detects sessions
 
 MIT. See [LICENSE](LICENSE).
 
+## Troubleshooting
+
+### Ollama wedge / timeouts during install
+
+If the initial index pass produces lots of `context deadline exceeded` errors and no metadata files get written, Ollama's daemon may have wedged (a known Ollama bug under heavy back-to-back calls). Restart it:
+
+**Windows:**
+```powershell
+Get-Process | Where-Object { $_.Name -match "ollama" } | Stop-Process -Force
+Start-Sleep 3
+ollama serve  # or just open the Ollama app
+```
+
+**Linux/macOS:**
+```bash
+killall ollama
+sleep 3
+ollama serve &
+```
+
+Then re-run `void-memory index`. Most users won't hit this — it manifests on:
+- Long-running sessions (>500 prompts, >7 days)
+- Concurrent CLI commands while a live Claude Code session is running
+- Tier B (8GB VRAM) hardware under heavy load
+
+### Recall returns empty synthesis
+
+Means no candidate sessions matched your query's category + entities. Try:
+```
+void-memory topics                    # browse what got indexed
+void-memory topics gameplay           # filter by category
+void-memory recall "<your query>"     # see the routing decision
+```
+
+If the routing result looks correct but no sessions surface, you may need to reindex (`void-memory index`) — the indexer might have failed silently on earlier passes.
+
+### Synthesis hallucinates
+
+Open an issue with the query + the synthesis output. Phase 5 prompt tuning is ongoing.
+
 ## Status
 
 Pre-alpha. Built for personal use, opened up. PRs and issues welcome.
