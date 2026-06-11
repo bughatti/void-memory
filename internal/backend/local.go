@@ -1,0 +1,174 @@
+// local.go implements MemoryBackend against the local filesystem +
+// local Ollama. This is the only backend that ships in v1; ServerBackend
+// (server.go, Phase 6) is the natural extension when multi-machine
+// sharing is needed.
+package backend
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/bughatti/void-memory/internal/catalog"
+	"github.com/bughatti/void-memory/internal/indexer"
+	"github.com/bughatti/void-memory/internal/ollama"
+	"github.com/bughatti/void-memory/internal/recall"
+	"github.com/bughatti/void-memory/pkg/types"
+)
+
+// LocalBackend wires catalog + indexer + recall against local resources.
+type LocalBackend struct {
+	cat   *catalog.Catalog
+	idx   *indexer.Indexer
+	rt    *recall.Router
+	syn   *recall.Synthesizer
+	llm   *ollama.Client
+	model string
+
+	cancel context.CancelFunc
+}
+
+// LocalConfig holds the config the LocalBackend needs at construction.
+type LocalConfig struct {
+	DataDir              string // ~/.void-memory by default
+	ProjectsDir          string // ~/.claude/projects
+	OllamaURL            string // "" → localhost:11434
+	Model                string // e.g. "qwen2.5-coder:7b"
+	DisableBackgroundIdx bool   // CLI subcommands set this true so IndexNow doesn't race the watcher goroutine
+}
+
+// NewLocal constructs and starts the LocalBackend. The catalog is loaded
+// from disk, the indexer is started in a background goroutine, and the
+// router/synthesizer are wired against the configured Ollama. Returns an
+// error if Ollama is unreachable or the catalog can't be loaded.
+func NewLocal(cfg LocalConfig) (*LocalBackend, error) {
+	if cfg.Model == "" {
+		cfg.Model = "qwen2.5-coder:7b"
+	}
+	cat := catalog.New(cfg.DataDir)
+	if err := cat.Load(); err != nil {
+		return nil, fmt.Errorf("load catalog: %w", err)
+	}
+	llm := ollama.New(cfg.OllamaURL)
+
+	// Don't hard-fail if Ollama is briefly unreachable at startup — the
+	// indexer/recall steps will surface errors when they're called. This
+	// keeps the MCP server alive across Ollama restarts.
+	_, _ = llm.Version(context.Background())
+
+	ext := indexer.NewExtractor(llm, cfg.Model)
+	idx := indexer.New(cat, ext, cfg.ProjectsDir)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if !cfg.DisableBackgroundIdx {
+		go func() {
+			if err := idx.Run(ctx); err != nil {
+				fmt.Fprintf(stderrLog, "indexer stopped: %v\n", err)
+			}
+		}()
+	}
+
+	return &LocalBackend{
+		cat:    cat,
+		idx:    idx,
+		rt:     recall.NewRouter(llm, cfg.Model),
+		syn:    recall.NewSynthesizer(llm, cfg.Model),
+		llm:    llm,
+		model:  cfg.Model,
+		cancel: cancel,
+	}, nil
+}
+
+// stderrLog is a tiny adapter so we don't import "os" just for one line.
+var stderrLog = (interface {
+	Write([]byte) (int, error)
+})(stderrWriter{})
+
+type stderrWriter struct{}
+
+func (stderrWriter) Write(b []byte) (int, error) {
+	return fmt.Print(string(b))
+}
+
+// Recall implements MemoryBackend.
+func (b *LocalBackend) Recall(ctx context.Context, query string, hints RecallHints) (*types.RecallResult, error) {
+	route, err := b.rt.Route(ctx, query, hints.RecentEntities)
+	if err != nil {
+		return nil, fmt.Errorf("route: %w", err)
+	}
+	if !route.NeedsContext {
+		return &types.RecallResult{
+			Synthesis:     "",
+			RoutingResult: route,
+			GeneratedAt:   time.Now().UTC(),
+		}, nil
+	}
+	candidates := recall.ScopeCandidates(b.cat, route, 8)
+	res, err := b.syn.Synthesize(ctx, query, route, candidates, hints.MaxTokens)
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// ReadSession implements MemoryBackend.
+func (b *LocalBackend) ReadSession(ctx context.Context, sessionID string) (*types.SessionTranscript, error) {
+	meta, ok := b.cat.Get(sessionID)
+	if !ok {
+		return nil, fmt.Errorf("session %s not in catalog", sessionID)
+	}
+	ps, err := indexer.ParseFile(meta.JSONLPath)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", meta.JSONLPath, err)
+	}
+	return &types.SessionTranscript{
+		SessionID: ps.SessionID,
+		Path:      ps.Path,
+		Messages:  ps.Messages,
+	}, nil
+}
+
+// ListTopics implements MemoryBackend. category="" returns all.
+func (b *LocalBackend) ListTopics(ctx context.Context, category string) ([]types.SessionMeta, error) {
+	cat := strings.TrimSpace(category)
+	if cat == "" {
+		return b.cat.All(), nil
+	}
+	return b.cat.FindByCategory(cat), nil
+}
+
+// IndexStatus implements MemoryBackend.
+func (b *LocalBackend) IndexStatus(ctx context.Context) (*Status, error) {
+	stats := b.idx.Stats(b.cat)
+	reachable := true
+	if _, err := b.llm.Version(ctx); err != nil {
+		reachable = false
+	}
+	last := stats.LastRun.Format(time.RFC3339)
+	if stats.LastRun.IsZero() {
+		last = "never"
+	}
+	return &Status{
+		Backend:         "local",
+		SessionCount:    stats.Sessions,
+		LastIndexedAt:   last,
+		ModelInUse:      b.model,
+		OllamaReachable: reachable,
+		IndexerQueueLen: stats.QueueLen,
+	}, nil
+}
+
+// Close implements MemoryBackend.
+func (b *LocalBackend) Close() error {
+	if b.cancel != nil {
+		b.cancel()
+	}
+	return nil
+}
+
+// IndexNow runs a synchronous indexing pass — used by the bootstrap step
+// before the MCP server is fully serving.
+func (b *LocalBackend) IndexNow(ctx context.Context) error {
+	return b.idx.IndexNow(ctx)
+}

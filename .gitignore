@@ -1,0 +1,21 @@
+# Build artifacts
+void-memory.exe
+void-memory
+*.bin
+dist/
+
+# Go
+*.test
+*.out
+go.work
+go.work.sum
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
