@@ -1,6 +1,10 @@
-# Build artifacts
-void-memory.exe
-void-memory
+# Build artifacts (anchored to repo root so cmd/void-memory/ stays tracked)
+/void-memory.exe
+/void-memory
+/void-memory-windows-amd64.exe
+/void-memory-linux-amd64
+/void-memory-darwin-amd64
+/void-memory-darwin-arm64
 *.bin
 dist/
 
