@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            suffix: .exe
+            name: void-memory-windows-amd64.exe
+          - goos: linux
+            goarch: amd64
+            suffix: ''
+            name: void-memory-linux-amd64
+          - goos: darwin
+            goarch: amd64
+            suffix: ''
+            name: void-memory-darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            suffix: ''
+            name: void-memory-darwin-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -trimpath -ldflags="-s -w" -o ${{ matrix.name }} ./cmd/void-memory
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF#refs/tags/}" \
+            --title "void-memory ${GITHUB_REF#refs/tags/}" \
+            --notes "Automated build for ${GITHUB_REF#refs/tags/}. See README for install instructions." \
+            dist/*
