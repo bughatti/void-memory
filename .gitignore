@@ -25,3 +25,5 @@ go.work.sum
 Thumbs.db
 
 void-memory-hybrid.exe
+
+void-memory.exe.bak*
