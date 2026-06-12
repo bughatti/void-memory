@@ -11,6 +11,58 @@ import (
 	"github.com/bughatti/void-memory/pkg/types"
 )
 
+// Synthesizer reads retrieved chunks and produces the recall block returned to
+// Claude. (The legacy whole-session router+synthesizer was removed once hybrid
+// retrieval was validated; this is the only synthesis path now.)
+type Synthesizer struct {
+	llm   *ollama.Client
+	model string
+}
+
+func NewSynthesizer(llm *ollama.Client, model string) *Synthesizer {
+	return &Synthesizer{llm: llm, model: model}
+}
+
+// stripCodeFence trims a wrapping markdown code fence if the model added one
+// despite the prompt forbidding it (small models sometimes do). Guarantees the
+// recall block isn't polluted with ``` lines regardless of model behavior.
+func stripCodeFence(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "```") {
+		if i := strings.IndexByte(s, '\n'); i >= 0 {
+			s = s[i+1:]
+		}
+		if j := strings.LastIndex(s, "```"); j >= 0 {
+			s = s[:j]
+		}
+	}
+	return strings.TrimSpace(s)
+}
+
+func buildSynthesisSystemPrompt(maxTokens int) string {
+	return fmt.Sprintf(`You are the recall synthesizer for void-memory. Your job is to read PRIOR CONVERSATION EXCERPTS and produce a focused recall block that gives the assistant the context it needs to answer the CURRENT USER PROMPT well — without re-explaining unrelated history.
+
+HARD RULES (violations are bugs, not stylistic preferences):
+
+1. **No hallucination, ever.** Every fact in your output MUST appear in the SOURCE EXCERPTS provided below. Do NOT inject general knowledge about the user's domain (WoW levels, default versions, common configurations, "industry standard" advice). If something is not in the excerpts, do not include it. When in doubt, omit.
+
+2. **Cite or omit.** Every concrete claim (number, name, file path, decision) must be tied to a session by citing the session_id in brackets like [SESSION_ID]. If you cannot cite, do not state.
+
+3. **Prefer the most recent.** Excerpts are tagged with session ids and chunk ids. When the excerpts contain conflicting or evolving data, STATE the most recent values and note "(superseded earlier value: X)" only if the user might still care about the older value. Resolved transient facts (in-flight bugs, debugging context) should be DROPPED, not summarized.
+
+4. **Empty-is-OK.** If the excerpts contain nothing actually relevant to the current prompt, return an empty string. Returning nothing is correct — false positives are worse than gaps.
+
+5. **Verbatim values.** Preserve the user's actual numbers, item names, function names, file paths, and command outputs. Do not paraphrase or "clean up" their phrasing.
+
+OUTPUT FORMAT (follow EXACTLY):
+- Output ONLY the recall block. No greetings, no "here is the context".
+- Wrap the ENTIRE output in EXACTLY these tags: <prior-work> ... </prior-work>. Do NOT use any other tag name (not <recall_block>, not <priority>). Do NOT wrap it in markdown code fences (no triple backticks).
+- Keep under approximately %d tokens (about %d characters).
+- Order: load-bearing facts first (current state, key decisions, active blockers), secondary detail trailing.
+
+Be terse, be precise, be faithful to the source excerpts.`, maxTokens, maxTokens*4)
+}
+
 // SynthesizeChunks is the hybrid-retrieval synthesis path: instead of searching
 // whole candidate sessions, it is handed the already-retrieved top-K chunks and
 // produces the recall block over just those. This is the "defer the LLM to query
@@ -63,7 +115,7 @@ func (s *Synthesizer) SynthesizeChunks(
 	if err != nil {
 		return nil, fmt.Errorf("synthesize chunks llm: %w", err)
 	}
-	synthesis := strings.TrimSpace(out)
+	synthesis := stripCodeFence(out)
 	return &types.RecallResult{
 		Synthesis:     synthesis,
 		SessionsUsed:  used,

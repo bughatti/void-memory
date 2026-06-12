@@ -7,6 +7,7 @@ package backend
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -22,7 +23,6 @@ import (
 type LocalBackend struct {
 	cat   *catalog.Catalog
 	idx   *indexer.Indexer
-	rt    *recall.Router
 	syn   *recall.Synthesizer
 	llm   *ollama.Client
 	model string
@@ -89,7 +89,6 @@ func NewLocal(cfg LocalConfig) (*LocalBackend, error) {
 	b := &LocalBackend{
 		cat:         cat,
 		idx:         idx,
-		rt:          recall.NewRouter(llm, cfg.Model),
 		syn:         recall.NewSynthesizer(llm, cfg.Model),
 		llm:         llm,
 		model:       cfg.Model,
@@ -105,7 +104,10 @@ func NewLocal(cfg LocalConfig) (*LocalBackend, error) {
 	return b, nil
 }
 
-// stderrLog is a tiny adapter so we don't import "os" just for one line.
+// stderrLog routes diagnostic output to STDERR. This is critical: when running
+// as the MCP server, stdout carries the JSON-RPC protocol stream, so any
+// diagnostic written to stdout would corrupt it. (Previously this used
+// fmt.Print → stdout, which is why hybrid's startup log broke MCP/JSON output.)
 var stderrLog = (interface {
 	Write([]byte) (int, error)
 })(stderrWriter{})
@@ -113,33 +115,19 @@ var stderrLog = (interface {
 type stderrWriter struct{}
 
 func (stderrWriter) Write(b []byte) (int, error) {
-	return fmt.Print(string(b))
+	return fmt.Fprint(os.Stderr, string(b))
 }
 
-// Recall implements MemoryBackend. When the hybrid path is enabled and an index
-// is loaded, it bypasses the LLM router entirely — retrieval is the gate, and
-// the LLM is deferred to synthesis over the small retrieved set.
+// Recall implements MemoryBackend. Retrieval (hybrid BM25 + binary-vector) is
+// the gate; the LLM is deferred to synthesis over the small retrieved set. The
+// legacy LLM-routing/scoping path has been removed.
 func (b *LocalBackend) Recall(ctx context.Context, query string, hints RecallHints) (*types.RecallResult, error) {
-	if b.useHybrid && b.hybrid != nil && b.hybrid.Len() > 0 {
+	if b.hybrid != nil && b.hybrid.Len() > 0 {
 		return b.hybridRecall(ctx, query, hints)
 	}
-	route, err := b.rt.Route(ctx, query, hints.RecentEntities)
-	if err != nil {
-		return nil, fmt.Errorf("route: %w", err)
-	}
-	if !route.NeedsContext {
-		return &types.RecallResult{
-			Synthesis:     "",
-			RoutingResult: route,
-			GeneratedAt:   time.Now().UTC(),
-		}, nil
-	}
-	candidates := recall.ScopeCandidates(b.cat, route, 8)
-	res, err := b.syn.Synthesize(ctx, query, route, candidates, hints.MaxTokens)
-	if err != nil {
-		return nil, err
-	}
-	return res, nil
+	// Hybrid index not loaded — return empty rather than the removed legacy
+	// path. Run `void-memory reindex` to build the index.
+	return &types.RecallResult{GeneratedAt: time.Now().UTC()}, nil
 }
 
 // ReadSession implements MemoryBackend.
