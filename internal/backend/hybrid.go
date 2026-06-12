@@ -107,6 +107,22 @@ func (b *LocalBackend) hybridRecall(ctx context.Context, query string, hints Rec
 	return b.syn.SynthesizeChunks(ctx, query, results, hints.MaxTokens)
 }
 
+// HybridSearch runs retrieval ONLY (no LLM synthesis) — for validation/debug.
+// Query embedding is CPU-pinned so it never competes with a foreground GPU app;
+// the whole call is GPU-free, demonstrating the core thesis.
+func (b *LocalBackend) HybridSearch(ctx context.Context, query string, k int) ([]retrieval.Result, error) {
+	if b.hybrid == nil || b.hybrid.Len() == 0 {
+		return nil, fmt.Errorf("no hybrid index loaded; run `void-memory reindex` first")
+	}
+	var qv []float32
+	if v, err := b.llm.EmbeddingsCPU(ctx, b.embModel, query); err != nil {
+		fmt.Fprintf(stderrLog, "hybrid search: query embed failed, lexical-only: %v\n", err)
+	} else {
+		qv = v
+	}
+	return b.hybrid.Search(qv, query, k, retrieval.SearchOptions{}), nil
+}
+
 // loadHybridIndex attempts to load a persisted index at startup. A missing
 // index is not an error — the backend serves legacy recall until ReindexHybrid
 // is run.

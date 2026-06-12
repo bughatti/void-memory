@@ -69,7 +69,7 @@ func main() {
 	// runs; only the MCP serving mode keeps it on.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
-		case "index", "recall", "status", "topics", "reindex":
+		case "index", "recall", "status", "topics", "reindex", "search":
 			cfg.DisableBackgroundIdx = true
 		}
 	}
@@ -102,6 +102,12 @@ func main() {
 			return
 		case "reindex":
 			runReindexCmd(be)
+			return
+		case "search":
+			if len(os.Args) < 3 {
+				log.Fatal("usage: void-memory search \"<query>\"")
+			}
+			runSearchCmd(be, strings.Join(os.Args[2:], " "))
 			return
 		}
 	}
@@ -156,6 +162,23 @@ func runRecallCmd(be *backend.LocalBackend, query string) {
 	}
 	b, _ := json.MarshalIndent(res, "", "  ")
 	fmt.Println(string(b))
+}
+
+func runSearchCmd(be *backend.LocalBackend, query string) {
+	ctx := context.Background()
+	results, err := be.HybridSearch(ctx, query, 8)
+	if err != nil {
+		log.Fatalf("search: %v", err)
+	}
+	fmt.Printf("query: %q\n%d results (retrieval-only, no LLM, CPU):\n", query, len(results))
+	for i, r := range results {
+		snippet := r.Chunk.Text
+		if len(snippet) > 220 {
+			snippet = snippet[:220]
+		}
+		snippet = strings.ReplaceAll(snippet, "\n", " ")
+		fmt.Printf("\n#%d  score=%.5f  [%s]\n  %s...\n", i+1, r.Score, r.Chunk.ID, snippet)
+	}
 }
 
 func runReindexCmd(be *backend.LocalBackend) {

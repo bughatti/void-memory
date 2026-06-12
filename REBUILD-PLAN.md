@@ -73,9 +73,17 @@ shared** — only where the index lives differs.
   `C:\Users\liquidai\void-memory-index-backup` (14 meta files). Transcripts
   (`~/.claude/projects/*.jsonl`) confirmed sacred/read-only — never modified. Go toolchain install
   (was missing on this box AND the NAS).
-- [ ] **Stage 1 — Local hybrid core.** `ollama.Embeddings()`; `internal/retrieval` (chunk, BM25,
+- [~] **Stage 1 — Local hybrid core.** `ollama.Embeddings()`; `internal/retrieval` (chunk, BM25,
   binary-quant + Hamming, RRF) with unit tests; wire `LocalBackend.Recall` to use it (behind a flag
   so the old path is reversible). Validate recall quality vs current 3b on real queries.
+  - DONE: retrieval core + tests, ingestion, wiring, CPU-pinned embed, first reindex (~4400 chunks).
+  - DONE (cut 1): legacy LLM indexer disabled in hybrid mode (no longer loads the synth LLM on GPU).
+  - TODO (cut 2, after validation): DELETE the legacy path entirely — `recall/router.go`,
+    `indexer/extract.go` + the watcher's LLM calls, `recall/synthesize.go` (legacy session-scoping
+    synthesizer, superseded by `synthesize_chunks.go`), and the LLM-extracted catalog metadata
+    (Category/Entities/SubTopics/Summary/Tags). Keep `indexer/parser.go` + `EnumerateProjectsDir`
+    (hybrid needs them). Rebuild `list_topics`/`index_status` off the hybrid index.
+  - TODO: run hybrid-vs-3b recall comparison on real queries.
 - [ ] **Stage 2 — Server store.** Stand up isolated `void-memory-db` (pgvector/pg16) on the NAS.
   Schema: chunks + tsvector + binary vector. (Needs explicit go-ahead — touches production NAS.)
 - [ ] **Stage 3 — memory-api (FastAPI).** Ingest/chunk/embed + hybrid retrieve endpoints on the NAS.
