@@ -14,6 +14,7 @@ import (
 	"github.com/bughatti/void-memory/internal/indexer"
 	"github.com/bughatti/void-memory/internal/ollama"
 	"github.com/bughatti/void-memory/internal/recall"
+	"github.com/bughatti/void-memory/internal/retrieval"
 	"github.com/bughatti/void-memory/pkg/types"
 )
 
@@ -26,6 +27,15 @@ type LocalBackend struct {
 	llm   *ollama.Client
 	model string
 
+	// Hybrid-retrieval path (gated by config). When useHybrid is true and a
+	// hybrid index is loaded, Recall uses it instead of the legacy LLM-routing
+	// path. dataDir/projectsDir/embModel are retained for (re)indexing.
+	dataDir     string
+	projectsDir string
+	embModel    string
+	useHybrid   bool
+	hybrid      *retrieval.HybridIndex
+
 	cancel context.CancelFunc
 }
 
@@ -35,6 +45,8 @@ type LocalConfig struct {
 	ProjectsDir          string // ~/.claude/projects
 	OllamaURL            string // "" → localhost:11434
 	Model                string // e.g. "qwen2.5-coder:7b"
+	Retrieval            string // "hybrid" enables the hybrid path; "" = legacy LLM-routing
+	EmbModel             string // embedding model for hybrid (e.g. "nomic-embed-text")
 	DisableBackgroundIdx bool   // CLI subcommands set this true so IndexNow doesn't race the watcher goroutine
 }
 
@@ -69,15 +81,23 @@ func NewLocal(cfg LocalConfig) (*LocalBackend, error) {
 		}()
 	}
 
-	return &LocalBackend{
-		cat:    cat,
-		idx:    idx,
-		rt:     recall.NewRouter(llm, cfg.Model),
-		syn:    recall.NewSynthesizer(llm, cfg.Model),
-		llm:    llm,
-		model:  cfg.Model,
-		cancel: cancel,
-	}, nil
+	b := &LocalBackend{
+		cat:         cat,
+		idx:         idx,
+		rt:          recall.NewRouter(llm, cfg.Model),
+		syn:         recall.NewSynthesizer(llm, cfg.Model),
+		llm:         llm,
+		model:       cfg.Model,
+		dataDir:     cfg.DataDir,
+		projectsDir: cfg.ProjectsDir,
+		embModel:    cfg.EmbModel,
+		useHybrid:   cfg.Retrieval == "hybrid",
+		cancel:      cancel,
+	}
+	if b.useHybrid {
+		b.loadHybridIndex()
+	}
+	return b, nil
 }
 
 // stderrLog is a tiny adapter so we don't import "os" just for one line.
@@ -91,8 +111,13 @@ func (stderrWriter) Write(b []byte) (int, error) {
 	return fmt.Print(string(b))
 }
 
-// Recall implements MemoryBackend.
+// Recall implements MemoryBackend. When the hybrid path is enabled and an index
+// is loaded, it bypasses the LLM router entirely — retrieval is the gate, and
+// the LLM is deferred to synthesis over the small retrieved set.
 func (b *LocalBackend) Recall(ctx context.Context, query string, hints RecallHints) (*types.RecallResult, error) {
+	if b.useHybrid && b.hybrid != nil && b.hybrid.Len() > 0 {
+		return b.hybridRecall(ctx, query, hints)
+	}
 	route, err := b.rt.Route(ctx, query, hints.RecentEntities)
 	if err != nil {
 		return nil, fmt.Errorf("route: %w", err)

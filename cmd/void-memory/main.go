@@ -69,7 +69,7 @@ func main() {
 	// runs; only the MCP serving mode keeps it on.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
-		case "index", "recall", "status", "topics":
+		case "index", "recall", "status", "topics", "reindex":
 			cfg.DisableBackgroundIdx = true
 		}
 	}
@@ -99,6 +99,9 @@ func main() {
 				cat = os.Args[2]
 			}
 			runTopicsCmd(be, cat)
+			return
+		case "reindex":
+			runReindexCmd(be)
 			return
 		}
 	}
@@ -155,6 +158,15 @@ func runRecallCmd(be *backend.LocalBackend, query string) {
 	fmt.Println(string(b))
 }
 
+func runReindexCmd(be *backend.LocalBackend) {
+	ctx := context.Background()
+	log.Printf("rebuilding hybrid index (chunk + embed all transcripts)...")
+	if err := be.ReindexHybrid(ctx); err != nil {
+		log.Fatalf("reindex: %v", err)
+	}
+	log.Printf("hybrid index rebuilt and saved")
+}
+
 func runStatusCmd(be *backend.LocalBackend) {
 	ctx := context.Background()
 	st, err := be.IndexStatus(ctx)
@@ -197,6 +209,16 @@ func loadConfig() backend.LocalConfig {
 	}
 	if v := os.Getenv("VOID_MEMORY_MODEL"); v != "" {
 		cfg.Model = v
+	}
+	if v := os.Getenv("VOID_MEMORY_RETRIEVAL"); v != "" {
+		cfg.Retrieval = v
+	}
+	if v := os.Getenv("VOID_MEMORY_EMBED_MODEL"); v != "" {
+		cfg.EmbModel = v
+	}
+	// Sensible default embed model when hybrid is enabled but unspecified.
+	if cfg.Retrieval == "hybrid" && cfg.EmbModel == "" {
+		cfg.EmbModel = "nomic-embed-text"
 	}
 	return cfg
 }
