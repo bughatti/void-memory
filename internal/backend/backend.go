@@ -26,8 +26,8 @@ type MemoryBackend interface {
 	// the synthesis isn't enough and Claude wants the raw conversation.
 	ReadSession(ctx context.Context, sessionID string) (*types.SessionTranscript, error)
 
-	// ListTopics returns the catalog of session metadata, optionally filtered
-	// by category. Used for manual exploration / debugging.
+	// ListTopics returns the indexed sessions (derived from the hybrid index)
+	// for manual exploration / debugging. The category arg is legacy/ignored.
 	ListTopics(ctx context.Context, category string) ([]types.SessionMeta, error)
 
 	// IndexStatus returns runtime telemetry: how many sessions indexed, when

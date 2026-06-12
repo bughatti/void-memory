@@ -63,16 +63,6 @@ func main() {
 	}
 
 	cfg := loadConfig()
-	// CLI subcommands run synchronously and would race against the
-	// fsnotify-driven background indexer (both processing the same files,
-	// doubling LLM cost). Disable the background indexer for one-shot CLI
-	// runs; only the MCP serving mode keeps it on.
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "index", "recall", "status", "topics", "reindex", "search":
-			cfg.DisableBackgroundIdx = true
-		}
-	}
 	be, err := backend.NewLocal(cfg)
 	if err != nil {
 		log.Fatalf("local backend init: %v", err)
@@ -81,9 +71,6 @@ func main() {
 
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
-		case "index":
-			runIndexCmd(be)
-			return
 		case "recall":
 			if len(os.Args) < 3 {
 				log.Fatal("usage: void-memory recall \"<query>\"")
@@ -141,17 +128,6 @@ func runInstallCmd() {
 	if err := vmi.Run(context.Background(), abs, true); err != nil {
 		log.Fatalf("install: %v", err)
 	}
-}
-
-func runIndexCmd(be *backend.LocalBackend) {
-	ctx := context.Background()
-	log.Printf("running synchronous index pass...")
-	if err := be.IndexNow(ctx); err != nil {
-		log.Fatalf("index: %v", err)
-	}
-	st, _ := be.IndexStatus(ctx)
-	b, _ := json.MarshalIndent(st, "", "  ")
-	fmt.Println(string(b))
 }
 
 func runRecallCmd(be *backend.LocalBackend, query string) {
@@ -219,7 +195,8 @@ func loadConfig() backend.LocalConfig {
 		DataDir:     filepath.Join(home, ".void-memory"),
 		ProjectsDir: filepath.Join(home, ".claude", "projects"),
 		OllamaURL:   "",
-		Model:       "qwen2.5-coder:7b",
+		Model:       "qwen2.5-coder:3b",
+		EmbModel:    "nomic-embed-text",
 	}
 	if v := os.Getenv("VOID_MEMORY_DATA_DIR"); v != "" {
 		cfg.DataDir = v
@@ -233,15 +210,8 @@ func loadConfig() backend.LocalConfig {
 	if v := os.Getenv("VOID_MEMORY_MODEL"); v != "" {
 		cfg.Model = v
 	}
-	if v := os.Getenv("VOID_MEMORY_RETRIEVAL"); v != "" {
-		cfg.Retrieval = v
-	}
 	if v := os.Getenv("VOID_MEMORY_EMBED_MODEL"); v != "" {
 		cfg.EmbModel = v
-	}
-	// Sensible default embed model when hybrid is enabled but unspecified.
-	if cfg.Retrieval == "hybrid" && cfg.EmbModel == "" {
-		cfg.EmbModel = "nomic-embed-text"
 	}
 	return cfg
 }

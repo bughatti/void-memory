@@ -5,7 +5,7 @@
 //   - patch ~/.claude.json to register the MCP server
 //   - patch ~/.claude/settings.json to add the allow rules
 //   - drop the hard-rule memory entry
-//   - run an initial index pass so the catalog is warm
+//   - build the initial hybrid index (CPU-pinned embed)
 //
 // Invoked from main via `void-memory.exe install` — keeps everything in
 // one binary so there's nothing else to deploy.
@@ -43,29 +43,23 @@ type Recommendation struct {
 }
 
 func Pick(hw Hardware) Recommendation {
+	// Only the synthesis model touches the GPU (one call per recall); hybrid
+	// retrieval is CPU-only. So size the synthesis model to leave headroom when
+	// the GPU is shared (e.g. a running game) — an 8GB card can't safely host a
+	// 7B alongside a game (learned the hard way; see REBUILD-PLAN.md).
 	if !hw.HasGPU || hw.VRAMMiB < 4000 {
 		if hw.RAMGiB >= 16 {
-			return Recommendation{
-				Tier:   "C",
-				Model:  "phi3.5:3.8b",
-				Reason: "CPU-only or low-VRAM detected; small model picked for speed on RAM.",
-			}
+			return Recommendation{Tier: "C", Model: "qwen2.5-coder:3b", Reason: "CPU-only or low VRAM; 3B synthesis on RAM. Retrieval is CPU-only regardless."}
 		}
-		return Recommendation{
-			Tier:   "D",
-			Model:  "phi3.5:3.8b",
-			Reason: "Constrained hardware; will run synthesis slowly. Consider upgrading or using server backend.",
-		}
+		return Recommendation{Tier: "D", Model: "qwen2.5-coder:3b", Reason: "Constrained hardware; 3B synthesis will be slow. Consider server mode."}
 	}
 	switch {
 	case hw.VRAMMiB >= 22000:
-		return Recommendation{Tier: "S", Model: "qwen2.5-coder:32b", Reason: "24GB+ VRAM — fits 32B Q4 with headroom."}
+		return Recommendation{Tier: "S", Model: "qwen2.5-coder:14b", Reason: "24GB+ VRAM — 14B synthesis with headroom."}
 	case hw.VRAMMiB >= 12000:
-		return Recommendation{Tier: "A", Model: "qwen2.5-coder:14b", Reason: "12-16GB VRAM — 14B Q4 is the sweet spot."}
-	case hw.VRAMMiB >= 7000:
-		return Recommendation{Tier: "B", Model: "qwen2.5-coder:7b", Reason: "8-12GB VRAM — 7B Q4 fits comfortably."}
+		return Recommendation{Tier: "A", Model: "qwen2.5-coder:7b", Reason: "12-16GB VRAM — 7B synthesis fits alongside other GPU use."}
 	default:
-		return Recommendation{Tier: "C", Model: "qwen2.5-coder:7b", Reason: "Below 8GB VRAM — 7B will run but may swap."}
+		return Recommendation{Tier: "B", Model: "qwen2.5-coder:3b", Reason: "<=12GB VRAM — 3B synthesis stays safe when the GPU is shared with a game. Hybrid retrieval is CPU-only."}
 	}
 }
 
@@ -185,7 +179,7 @@ func EnsureOllama(ctx context.Context, model string) error {
 
 // PatchClaudeJSON writes the void-memory MCP server entry into
 // ~/.claude.json. Idempotent: re-running just updates the path.
-func PatchClaudeJSON(binaryPath string) error {
+func PatchClaudeJSON(binaryPath, model string) error {
 	home, _ := os.UserHomeDir()
 	path := filepath.Join(home, ".claude.json")
 	b, err := os.ReadFile(path)
@@ -203,7 +197,10 @@ func PatchClaudeJSON(binaryPath string) error {
 	mcp["void-memory"] = map[string]interface{}{
 		"command": binaryPath,
 		"args":    []string{},
-		"env":     map[string]string{},
+		"env": map[string]string{
+			"VOID_MEMORY_MODEL":       model,
+			"VOID_MEMORY_EMBED_MODEL": "nomic-embed-text",
+		},
 	}
 	data["mcpServers"] = mcp
 	out, _ := json.MarshalIndent(data, "", "  ")
@@ -267,9 +264,12 @@ func Run(ctx context.Context, binaryPath string, runInitialIndex bool) error {
 	if err := EnsureOllama(ctx, rec.Model); err != nil {
 		return err
 	}
-	fmt.Fprintln(os.Stderr, "Ollama + model: OK")
+	if err := EnsureOllama(ctx, "nomic-embed-text"); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr, "Ollama + models (synthesis + embed): OK")
 
-	if err := PatchClaudeJSON(binaryPath); err != nil {
+	if err := PatchClaudeJSON(binaryPath, rec.Model); err != nil {
 		return fmt.Errorf("patch claude.json: %w", err)
 	}
 	fmt.Fprintln(os.Stderr, "~/.claude.json: registered MCP server")
@@ -280,22 +280,22 @@ func Run(ctx context.Context, binaryPath string, runInitialIndex bool) error {
 	fmt.Fprintln(os.Stderr, "~/.claude/settings.json: allow rules added")
 
 	if runInitialIndex {
-		fmt.Fprintln(os.Stderr, "Running initial index pass (may take a few minutes for long histories)...")
+		fmt.Fprintln(os.Stderr, "Building initial hybrid index (CPU-pinned embed; may take a few minutes)...")
 		home, _ := os.UserHomeDir()
 		be, err := backend.NewLocal(backend.LocalConfig{
-			DataDir:              filepath.Join(home, ".void-memory"),
-			ProjectsDir:          filepath.Join(home, ".claude", "projects"),
-			Model:                rec.Model,
-			DisableBackgroundIdx: true,
+			DataDir:     filepath.Join(home, ".void-memory"),
+			ProjectsDir: filepath.Join(home, ".claude", "projects"),
+			Model:       rec.Model,
+			EmbModel:    "nomic-embed-text",
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "WARN: index init: %v (skipping — first session will trigger background index)\n", err)
+			fmt.Fprintf(os.Stderr, "WARN: index init: %v (run `void-memory reindex` later)\n", err)
 		} else {
 			defer be.Close()
-			if err := be.IndexNow(ctx); err != nil {
-				fmt.Fprintf(os.Stderr, "WARN: index pass: %v\n", err)
+			if err := be.ReindexHybrid(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "WARN: index build: %v\n", err)
 			} else {
-				fmt.Fprintln(os.Stderr, "Initial index pass: OK")
+				fmt.Fprintln(os.Stderr, "Initial hybrid index: OK")
 			}
 		}
 	}

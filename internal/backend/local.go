@@ -1,17 +1,18 @@
-// local.go implements MemoryBackend against the local filesystem +
-// local Ollama. This is the only backend that ships in v1; ServerBackend
-// (server.go, Phase 6) is the natural extension when multi-machine
-// sharing is needed.
+// local.go implements MemoryBackend against the local filesystem + local
+// Ollama. Retrieval is hybrid (BM25 + binary-quantized vectors over chunked
+// transcripts); the LLM is used only for query-time synthesis. The legacy
+// LLM router, metadata extractor, and catalog were removed — the hybrid index
+// is the single source of truth, and parser.go provides transcript reading.
 package backend
 
 import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/bughatti/void-memory/internal/catalog"
 	"github.com/bughatti/void-memory/internal/indexer"
 	"github.com/bughatti/void-memory/internal/ollama"
 	"github.com/bughatti/void-memory/internal/recall"
@@ -19,95 +20,57 @@ import (
 	"github.com/bughatti/void-memory/pkg/types"
 )
 
-// LocalBackend wires catalog + indexer + recall against local resources.
+// LocalBackend serves recall from a local hybrid index + local Ollama.
 type LocalBackend struct {
-	cat   *catalog.Catalog
-	idx   *indexer.Indexer
 	syn   *recall.Synthesizer
 	llm   *ollama.Client
 	model string
 
-	// Hybrid-retrieval path (gated by config). When useHybrid is true and a
-	// hybrid index is loaded, Recall uses it instead of the legacy LLM-routing
-	// path. dataDir/projectsDir/embModel are retained for (re)indexing.
 	dataDir     string
 	projectsDir string
 	embModel    string
-	useHybrid   bool
 	hybrid      *retrieval.HybridIndex
-
-	cancel context.CancelFunc
 }
 
 // LocalConfig holds the config the LocalBackend needs at construction.
 type LocalConfig struct {
-	DataDir              string // ~/.void-memory by default
-	ProjectsDir          string // ~/.claude/projects
-	OllamaURL            string // "" → localhost:11434
-	Model                string // e.g. "qwen2.5-coder:7b"
-	Retrieval            string // "hybrid" enables the hybrid path; "" = legacy LLM-routing
-	EmbModel             string // embedding model for hybrid (e.g. "nomic-embed-text")
-	DisableBackgroundIdx bool   // CLI subcommands set this true so IndexNow doesn't race the watcher goroutine
+	DataDir     string // ~/.void-memory by default
+	ProjectsDir string // ~/.claude/projects
+	OllamaURL   string // "" → localhost:11434
+	Model       string // synthesis model, e.g. "qwen2.5-coder:3b"
+	EmbModel    string // embedding model, e.g. "nomic-embed-text"
 }
 
-// NewLocal constructs and starts the LocalBackend. The catalog is loaded
-// from disk, the indexer is started in a background goroutine, and the
-// router/synthesizer are wired against the configured Ollama. Returns an
-// error if Ollama is unreachable or the catalog can't be loaded.
+// NewLocal constructs the backend and loads the persisted hybrid index (if any).
+// A missing index is not an error — recall returns empty until `reindex` runs.
 func NewLocal(cfg LocalConfig) (*LocalBackend, error) {
 	if cfg.Model == "" {
-		cfg.Model = "qwen2.5-coder:7b"
+		cfg.Model = "qwen2.5-coder:3b"
 	}
-	cat := catalog.New(cfg.DataDir)
-	if err := cat.Load(); err != nil {
-		return nil, fmt.Errorf("load catalog: %w", err)
+	if cfg.EmbModel == "" {
+		cfg.EmbModel = "nomic-embed-text"
 	}
 	llm := ollama.New(cfg.OllamaURL)
-
-	// Don't hard-fail if Ollama is briefly unreachable at startup — the
-	// indexer/recall steps will surface errors when they're called. This
-	// keeps the MCP server alive across Ollama restarts.
+	// Don't hard-fail if Ollama is briefly unreachable at startup — recall and
+	// reindex surface errors when called. Keeps the MCP server alive across
+	// Ollama restarts.
 	_, _ = llm.Version(context.Background())
 
-	ext := indexer.NewExtractor(llm, cfg.Model)
-	idx := indexer.New(cat, ext, cfg.ProjectsDir)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	// The legacy LLM-based metadata indexer exists ONLY to serve the old
-	// routing/scoping retrieval path. Hybrid retrieval doesn't use it, and it
-	// would load the synthesis LLM onto the GPU at index time — so don't start
-	// it in hybrid mode. (Full removal of the legacy path is scheduled once
-	// hybrid is validated; see REBUILD-PLAN.md.)
-	if !cfg.DisableBackgroundIdx && cfg.Retrieval != "hybrid" {
-		go func() {
-			if err := idx.Run(ctx); err != nil {
-				fmt.Fprintf(stderrLog, "indexer stopped: %v\n", err)
-			}
-		}()
-	}
-
 	b := &LocalBackend{
-		cat:         cat,
-		idx:         idx,
 		syn:         recall.NewSynthesizer(llm, cfg.Model),
 		llm:         llm,
 		model:       cfg.Model,
 		dataDir:     cfg.DataDir,
 		projectsDir: cfg.ProjectsDir,
 		embModel:    cfg.EmbModel,
-		useHybrid:   cfg.Retrieval == "hybrid",
-		cancel:      cancel,
 	}
-	if b.useHybrid {
-		b.loadHybridIndex()
-	}
+	b.loadHybridIndex()
 	return b, nil
 }
 
-// stderrLog routes diagnostic output to STDERR. This is critical: when running
-// as the MCP server, stdout carries the JSON-RPC protocol stream, so any
-// diagnostic written to stdout would corrupt it. (Previously this used
-// fmt.Print → stdout, which is why hybrid's startup log broke MCP/JSON output.)
+// stderrLog routes diagnostic output to STDERR. Critical: when running as the
+// MCP server, stdout carries the JSON-RPC protocol stream, so any diagnostic on
+// stdout would corrupt it.
 var stderrLog = (interface {
 	Write([]byte) (int, error)
 })(stderrWriter{})
@@ -118,75 +81,97 @@ func (stderrWriter) Write(b []byte) (int, error) {
 	return fmt.Fprint(os.Stderr, string(b))
 }
 
-// Recall implements MemoryBackend. Retrieval (hybrid BM25 + binary-vector) is
-// the gate; the LLM is deferred to synthesis over the small retrieved set. The
-// legacy LLM-routing/scoping path has been removed.
+// Recall implements MemoryBackend. Hybrid retrieval is the gate; the LLM is
+// deferred to synthesis over the small retrieved set.
 func (b *LocalBackend) Recall(ctx context.Context, query string, hints RecallHints) (*types.RecallResult, error) {
 	if b.hybrid != nil && b.hybrid.Len() > 0 {
 		return b.hybridRecall(ctx, query, hints)
 	}
-	// Hybrid index not loaded — return empty rather than the removed legacy
-	// path. Run `void-memory reindex` to build the index.
+	// No index loaded — return empty. Run `void-memory reindex` to build it.
 	return &types.RecallResult{GeneratedAt: time.Now().UTC()}, nil
 }
 
-// ReadSession implements MemoryBackend.
+// ReadSession implements MemoryBackend. Maps a session id (the JSONL filename
+// stem) back to its transcript by scanning the projects dir — no catalog needed.
 func (b *LocalBackend) ReadSession(ctx context.Context, sessionID string) (*types.SessionTranscript, error) {
-	meta, ok := b.cat.Get(sessionID)
-	if !ok {
-		return nil, fmt.Errorf("session %s not in catalog", sessionID)
-	}
-	ps, err := indexer.ParseFile(meta.JSONLPath)
+	paths, err := indexer.EnumerateProjectsDir(b.projectsDir)
 	if err != nil {
-		return nil, fmt.Errorf("parse %s: %w", meta.JSONLPath, err)
+		return nil, fmt.Errorf("enumerate transcripts: %w", err)
 	}
-	return &types.SessionTranscript{
-		SessionID: ps.SessionID,
-		Path:      ps.Path,
-		Messages:  ps.Messages,
-	}, nil
+	for _, p := range paths {
+		if strings.TrimSuffix(filepath.Base(p), ".jsonl") == sessionID {
+			ps, err := indexer.ParseFile(p)
+			if err != nil {
+				return nil, fmt.Errorf("parse %s: %w", p, err)
+			}
+			return &types.SessionTranscript{
+				SessionID: ps.SessionID,
+				Path:      ps.Path,
+				Messages:  ps.Messages,
+			}, nil
+		}
+	}
+	return nil, fmt.Errorf("session %s not found under %s", sessionID, b.projectsDir)
 }
 
-// ListTopics implements MemoryBackend. category="" returns all.
+// ListTopics implements MemoryBackend. Derives the session list from the hybrid
+// index (distinct sessions + their chunk counts + time spans). The category
+// filter is a legacy concept and is ignored.
 func (b *LocalBackend) ListTopics(ctx context.Context, category string) ([]types.SessionMeta, error) {
-	cat := strings.TrimSpace(category)
-	if cat == "" {
-		return b.cat.All(), nil
+	if b.hybrid == nil {
+		return nil, nil
 	}
-	return b.cat.FindByCategory(cat), nil
+	type agg struct {
+		start, end time.Time
+		n          int
+	}
+	m := map[string]*agg{}
+	for _, c := range b.hybrid.Chunks {
+		a := m[c.SessionID]
+		if a == nil {
+			a = &agg{start: c.StartTime, end: c.EndTime}
+			m[c.SessionID] = a
+		}
+		if !c.StartTime.IsZero() && (a.start.IsZero() || c.StartTime.Before(a.start)) {
+			a.start = c.StartTime
+		}
+		if c.EndTime.After(a.end) {
+			a.end = c.EndTime
+		}
+		a.n++
+	}
+	out := make([]types.SessionMeta, 0, len(m))
+	for id, a := range m {
+		out = append(out, types.SessionMeta{SessionID: id, StartTime: a.start, EndTime: a.end, ChunkCount: a.n})
+	}
+	return out, nil
 }
 
-// IndexStatus implements MemoryBackend.
+// IndexStatus implements MemoryBackend, reporting from the hybrid index.
 func (b *LocalBackend) IndexStatus(ctx context.Context) (*Status, error) {
-	stats := b.idx.Stats(b.cat)
+	sessions := map[string]struct{}{}
+	if b.hybrid != nil {
+		for _, c := range b.hybrid.Chunks {
+			sessions[c.SessionID] = struct{}{}
+		}
+	}
 	reachable := true
 	if _, err := b.llm.Version(ctx); err != nil {
 		reachable = false
 	}
-	last := stats.LastRun.Format(time.RFC3339)
-	if stats.LastRun.IsZero() {
-		last = "never"
+	last := "never"
+	if fi, err := os.Stat(hybridIndexPath(b.dataDir)); err == nil {
+		last = fi.ModTime().UTC().Format(time.RFC3339)
 	}
 	return &Status{
 		Backend:         "local",
-		SessionCount:    stats.Sessions,
+		SessionCount:    len(sessions),
 		LastIndexedAt:   last,
 		ModelInUse:      b.model,
 		OllamaReachable: reachable,
-		IndexerQueueLen: stats.QueueLen,
+		IndexerQueueLen: 0,
 	}, nil
 }
 
 // Close implements MemoryBackend.
-func (b *LocalBackend) Close() error {
-	if b.cancel != nil {
-		b.cancel()
-	}
-	return nil
-}
-
-// IndexNow runs a synchronous indexing pass — used by the bootstrap step
-// before the MCP server is fully serving.
-func (b *LocalBackend) IndexNow(ctx context.Context) error {
-	return b.idx.IndexNow(ctx)
-}
+func (b *LocalBackend) Close() error { return nil }

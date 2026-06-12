@@ -1,9 +1,7 @@
-// Package indexer reads Claude Code JSONL transcripts, extracts session
-// metadata via the local LLM, and upserts into the catalog.
-//
-// parser.go handles the JSONL streaming and message normalization. The
-// extraction step (LLM call) lives in extract.go and the watcher loop lives
-// in indexer.go.
+// Package indexer reads and normalizes Claude Code JSONL transcripts. It is now
+// purely a transcript parser — the hybrid retrieval pipeline (internal/retrieval
+// + internal/backend) consumes ParsedSession/Messages to chunk and embed. The
+// old LLM metadata extractor and fsnotify catalog watcher were removed.
 package indexer
 
 import (

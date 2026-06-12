@@ -74,7 +74,7 @@ func BuildHybridIndex(
 // swaps it in for live queries.
 func (b *LocalBackend) ReindexHybrid(ctx context.Context) error {
 	if b.embModel == "" {
-		return fmt.Errorf("hybrid retrieval not configured (set VOID_MEMORY_RETRIEVAL=hybrid and VOID_MEMORY_EMBED_MODEL)")
+		return fmt.Errorf("no embedding model configured (set VOID_MEMORY_EMBED_MODEL, e.g. nomic-embed-text)")
 	}
 	h, err := BuildHybridIndex(ctx, b.projectsDir, b.llm, b.embModel, retrieval.ChunkOptions{})
 	if err != nil {
