@@ -51,7 +51,11 @@ func BuildHybridIndex(
 				return nil, ctx.Err()
 			default:
 			}
-			vec, err := emb.Embeddings(ctx, embModel, c.Text)
+			// CPU-pinned: a batch reindex must never compete with a foreground
+			// GPU app (e.g. WoW) for VRAM — on an 8 GB card that contention can
+			// crash the display driver. Latency doesn't matter for a background
+			// build, so CPU is the safe default.
+			vec, err := emb.EmbeddingsCPU(ctx, embModel, c.Text)
 			if err != nil {
 				return nil, fmt.Errorf("embed chunk %s: %w", c.ID, err)
 			}

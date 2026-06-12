@@ -84,6 +84,10 @@ shared** — only where the index lives differs.
 - [ ] **Stage 5 — Rollout.** Backfill 20+ machines' transcripts; ongoing ingestion; docs.
 
 ## Hard constraints / don't-lose rules
+- **Reindex embeddings run CPU-pinned (`EmbeddingsCPU`, num_gpu=0).** A GPU batch embed
+  job during WoW oversubscribed the 8GB RTX 4060 (WoW + 3B synth model + embed model > 8GB)
+  and crashed WoW + the terminal on 2026-06-11. Batch builds have no latency requirement, so
+  they belong on the CPU; never run a sustained GPU job alongside the game on this box.
 - **Never modify `~/.claude/projects/*.jsonl`** — Claude Code's own transcripts, the source of truth.
 - Keep the **old retrieval path working** until the new one is validated; gate the new path behind
   config so rollback is `git checkout main` + restart.
