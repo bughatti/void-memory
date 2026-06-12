@@ -73,7 +73,12 @@ func NewLocal(cfg LocalConfig) (*LocalBackend, error) {
 	idx := indexer.New(cat, ext, cfg.ProjectsDir)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	if !cfg.DisableBackgroundIdx {
+	// The legacy LLM-based metadata indexer exists ONLY to serve the old
+	// routing/scoping retrieval path. Hybrid retrieval doesn't use it, and it
+	// would load the synthesis LLM onto the GPU at index time — so don't start
+	// it in hybrid mode. (Full removal of the legacy path is scheduled once
+	// hybrid is validated; see REBUILD-PLAN.md.)
+	if !cfg.DisableBackgroundIdx && cfg.Retrieval != "hybrid" {
 		go func() {
 			if err := idx.Run(ctx); err != nil {
 				fmt.Fprintf(stderrLog, "indexer stopped: %v\n", err)
