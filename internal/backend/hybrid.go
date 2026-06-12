@@ -93,8 +93,10 @@ func (b *LocalBackend) ReindexHybrid(ctx context.Context) error {
 func (b *LocalBackend) hybridRecall(ctx context.Context, query string, hints RecallHints) (*types.RecallResult, error) {
 	const topK = 8
 
+	// Query embed is a single cheap call — CPU-pin it so it never loads the
+	// embedder onto the GPU. Only the synthesis LLM uses the GPU at recall time.
 	var qvec []float32
-	if v, err := b.llm.Embeddings(ctx, b.embModel, query); err != nil {
+	if v, err := b.llm.EmbeddingsCPU(ctx, b.embModel, query); err != nil {
 		fmt.Fprintf(stderrLog, "hybrid: query embed failed, lexical-only: %v\n", err)
 	} else {
 		qvec = v
