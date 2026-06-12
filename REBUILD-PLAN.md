@@ -83,7 +83,19 @@ shared** — only where the index lives differs.
     synthesizer, superseded by `synthesize_chunks.go`), and the LLM-extracted catalog metadata
     (Category/Entities/SubTopics/Summary/Tags). Keep `indexer/parser.go` + `EnumerateProjectsDir`
     (hybrid needs them). Rebuild `list_topics`/`index_status` off the hybrid index.
-  - TODO: run hybrid-vs-3b recall comparison on real queries.
+  - DONE: hybrid-vs-legacy comparison — hybrid wins on relevance AND speed (legacy
+    retrieved the wrong session; hybrid ~4-7s clean <prior-work> blocks vs legacy 35s).
+  - DONE (cut 2): DELETED recall/router.go + recall/synthesize.go; Recall is hybrid-only.
+    Fixed critical stderrLog→stdout bug (would corrupt MCP JSON-RPC). Synthesis prompt
+    tightened + code-fence stripping.
+  - DONE (deploy): new binary installed as void-memory.exe (rollback at
+    void-memory.exe.bak-legacy); `.claude.json` env set VOID_MEMORY_RETRIEVAL=hybrid +
+    EMBED_MODEL=nomic-embed-text + MODEL=qwen2.5-coder:3b. **Activates on next Claude Code
+    restart.**
+  - STILL DEAD CODE (harmless, not run in hybrid mode; remove in a later cleanup):
+    indexer/extract.go (LLM metadata extractor) + the indexer watcher's LLM calls +
+    catalog Category/Entities/Summary metadata. ReadSession/ListTopics/IndexStatus still
+    lean on the catalog; rewire them off the hybrid index before deleting the indexer.
 - [ ] **Stage 2 — Server store.** Stand up isolated `void-memory-db` (pgvector/pg16) on the NAS.
   Schema: chunks + tsvector + binary vector. (Needs explicit go-ahead — touches production NAS.)
 - [ ] **Stage 3 — memory-api (FastAPI).** Ingest/chunk/embed + hybrid retrieve endpoints on the NAS.
